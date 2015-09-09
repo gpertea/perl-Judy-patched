@@ -1,0 +1,217 @@
+--- a/lib/Judy.pm	2011-01-20 16:57:41.000000000 +0100
++++ b/lib/Judy.pm	2011-11-03 11:48:13.000000000 +0100
+@@ -2,19 +2,98 @@
+ 
+ use strict;
+ use warnings;
+-use vars qw( $VERSION @ISA );
++use vars qw( $VERSION $DEBUG $HANDLE);
++use base qw(DynaLoader);
+ 
+ $VERSION = '0.41';
+ 
+-require Alien::Judy;
+-my $av_version = Alien::Judy->VERSION;
+-if ( $av_version < 0.18 ) {
+-    die "Alien::Judy version 0.18 required--this is only version $av_version";
++sub _libjudy_candidates {
++    # Get a list of possible libJudy.so files.
++    #
++    # When writing this module, I found it would occasionally not only
++    # find libJudy.so but also blib/arch/Judy/Judy.so which is the
++    # Perl XS module. That was when this -lJudy resolving code was
++    # directly in the Judy cpan module though which has a lib/Judy.xs
++    # file. It's plausible that it's entirely irrelevant now that this
++    # is in Alien::Judy.
++    #
++    my @candidate_libs = DynaLoader::dl_findfile('-lJudy');
++    if ( $DEBUG ) {
++        printf STDERR "candidates=@candidate_libs at %s line %d.\n", __FILE__, __LINE__;
++    }
++
++    # I found that Solaris would find libJudy.so with DynaLoader but
++    # ld.so.1 when loading libJudy.so for Judy.pm would fail to find
++    # the right library to link against.
++    #
++    # I don't particularly understand it however what worked was to
++    # attempt to load libJudy.so.1 first.
++    my @dot_one =
++        grep { -f }
++        map { "$_.1" }
++        @candidate_libs;
++
++    unshift @candidate_libs, @dot_one;
++
++    return @candidate_libs;
++}
++
++sub _dl_load_libjudy {
++    my @candidate_libs = @_;
++
++    # The libJudy I find must provide the base functions from the
++    # libJudy library. This is to possibly skip "wrong" libJudy
++    # libraries.
++#    @DynaLoader::dl_require_symbols = 'Judy1Test';
++
++    # Attempt to load each candidate until something succeeds. If one
++    # of the candidates happens to be the Perl XS module
++    # blib/arch/Judy/Judy.so then I'd like loading to keep trying and
++    # not fail. If I know how to predictably filter
++    # blib/arch/Judy/Judy.so out of this list I'd do that.
++    my $libjudy_loaded;
++  CANDIDATE_LIBRARY:
++    for my $libjudy_file ( @candidate_libs ) {
++        my $ok = eval {
++            $HANDLE = DynaLoader::dl_load_file( $libjudy_file, 0x01 );
++            1;
++        };
++        if ( $DEBUG ) {
++            my $msgf =
++                $ok
++                ? "Loaded $libjudy_file at %s line %d.\n"
++                : "Couldn't load $libjudy_file: $@ at %s line %d.\n";
++            printf STDERR $msgf, __FILE__, __LINE__;
++        }
++
++        if ( $ok ) {
++            $libjudy_loaded = 1;
++            last CANDIDATE_LIBRARY;
++        }
++    }
++
++    return $libjudy_loaded;
++}
++
++sub dl_load_libjudy {
++    #local @DynaLoader::dl_library_path = (
++     #   @DynaLoader::dl_library_path,
++     #   lib_dirs()
++    #);
++
++    # Enable DynaLoader debugging along with Judy debugging
++    local $DynaLoader::dl_debug = $DynaLoader::dl_debug;
++    if ( $DEBUG ) {
++        $DynaLoader::dl_debug ||= 1;
++    }
++
++    my @libjudy_files = _libjudy_candidates();
++
++    my $ok = _dl_load_libjudy( @libjudy_files );
++
++    return $ok;
+ }
+-Alien::Judy::dl_load_libjudy();
+ 
+-# Now load the Perl wrapper over libJudy
+-local @ISA = 'DynaLoader';
+ __PACKAGE__->bootstrap;
+ 
+ require Sub::Exporter;
+--- a/META.yml	2012-02-10 17:19:35.816028784 +0100
++++ b/META.yml	2012-02-10 18:39:32.136002247 +0100
+@@ -47,7 +47,6 @@
+     file: lib/Judy/SL.pm
+     version: 0
+ requires:
+-  Alien::Judy: 0.26
+   Config: 0
+   DynaLoader: 0
+   Sub::Exporter: 0
+--- a/META.json	2013-11-08 16:16:48.258428917 +0100
++++ b/META.json	2013-11-08 16:17:04.722454046 +0100
+@@ -40,7 +40,6 @@
+       },
+       "runtime" : {
+          "requires" : {
+-            "Alien::Judy" : "0.26",
+             "Config" : "0",
+             "DynaLoader" : "0",
+             "Sub::Exporter" : "0",
+--- a/Build.PL	2012-02-10 18:33:30.336000005 +0100
++++ b/Build.PL	2012-02-10 18:35:38.149998288 +0100
+@@ -1,13 +1,7 @@
+ #!perl
+-BEGIN {
+-    unshift @INC, 'inc';
+-}
+-use My::Builder;
+-use Config;
+-use File::Spec;
++use Module::Build;
+ 
+-
+-my $build = My::Builder->new(
++my $build = Module::Build->new(
+     module_name => 'Judy',
+     license => 'perl',
+     configure_requires => {
+@@ -26,7 +26,6 @@
+         'File::Spec'     => 0,
+         'File::Copy'     => 0,
+         'DynaLoader'     => 0,
+-
+         'Test::More'         => 0,
+         'Test::Deep'         => 0,
+         'ExtUtils::CBuilder' => 0,
+@@ -38,20 +38,12 @@
+         'DynaLoader' => 0,
+         'constant'   => 0,
+         'Config'     => 0,
+-
+         'Sub::Exporter' => 0,
+-        'Alien::Judy'   => '0.26',
+     },
+-
+     create_readme => 1,
+     dynamic_config => 1,
+-
+-    # Both of these values will be overwritten by My::Builder during
+-    # ACTION_build so the PERL5LIB of the moment can affect the usage
+-    # of -I and -L flags to find Judy.h and libJudy.so
+-    #
+-    include_dirs => [],
+-    extra_linker_flags => '',
++    include_dirs => [ '.' ],
++    extra_linker_flags => '-lJudy',
+ );
+ $build->create_build_script();
+ 
+--- a/t/MAGIC/Build.PL	2012-02-10 18:40:33.660001593 +0100
++++ b/t/MAGIC/Build.PL	2012-02-10 18:43:16.554000348 +0100
+@@ -1,7 +1,6 @@
+ #!perl
+ use Module::Build;
+ 
+-# Locate Judy-0.0.1/inc/Alien/Judy.pm
+ use File::Basename ();
+ use File::Spec ();
+ my ( $judy_dir, $magic_dir );
+@@ -12,13 +11,7 @@
+         '..',       # Judy-0.01/t/
+         '..',       # Judy-0.01/
+     );
+-    my $inc_dir = File::Spec->catdir(
+-        $judy_dir, # Judy-0.01/
+-        'inc'      # Judy-0.01/inc
+-    );
+-    unshift @INC, $inc_dir;
+ }
+-use Alien::Judy;
+ 
+ # Copy Judy-0.01/typemap to Judy-0.01/t/MAGIC/typemap
+ use File::Copy ();
+@@ -39,12 +32,9 @@
+         'Module::Build'  => 0,
+         'Cwd'            => 0,
+         'File::Basename' => 0,
++        'File::Copy'     => 0,
+         'File::Spec'     => 0,
+-        'Alien::Judy'   => '0.13',
+-    },
+-    build_requires => {
+-        'ExtUtils::CBuilder' => '0',
+     },
+-    include_dirs => [ $judy_dir, Alien::Judy::inc_dirs() ],
++    include_dirs => [ $judy_dir ],
+ );
+ $build->create_build_script;
